@@ -309,3 +309,62 @@ class Conv1d(ConvLoRA):
 class Conv3d(ConvLoRA):
     def __init__(self, *args, **kwargs):
         super(Conv3d, self).__init__(nn.Conv3d, *args, **kwargs)
+
+###############################################################################
+# New: LoRA support for LayerNorm finetuning
+###############################################################################
+
+class LoRALayerNorm(nn.LayerNorm, LoRALayer):
+    """
+    A LayerNorm layer augmented with LoRA.
+    If a low rank (r > 0) is specified, the original weight (gamma) is frozen and
+    a low-rank update is applied at runtime (or merged in eval mode).
+    """
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, 
+                 r: int = 0, lora_alpha: int = 1, lora_dropout: float = 0., 
+                 merge_weights: bool = True, **kwargs):
+        nn.LayerNorm.__init__(self, normalized_shape, eps, elementwise_affine, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+        if r > 0:
+            # For LayerNorm, weight is typically a 1D tensor (gamma). We set up low-rank matrices
+            # such that their product produces an update of the same shape.
+            # For a normalized_shape of (d,) or an int d, we use:
+            #   lora_A: (r, 1)
+            #   lora_B: (d, r)
+            if isinstance(self.normalized_shape, int):
+                d = self.normalized_shape
+            else:
+                d = self.normalized_shape[0]
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r, 1)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((d, r)))
+            self.scaling = self.lora_alpha / self.r
+            # Freeze the original weight parameter
+            self.weight.requires_grad = False
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.LayerNorm.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            nn.init.zeros_(self.lora_A)
+            nn.init.normal_(self.lora_B)
+
+    def train(self, mode: bool = True):
+        nn.LayerNorm.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                if self.r > 0:
+                    self.weight.data -= (self.lora_B @ self.lora_A).squeeze(-1) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                if self.r > 0:
+                    self.weight.data += (self.lora_B @ self.lora_A).squeeze(-1) * self.scaling
+                self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        if self.r > 0 and not self.merged:
+            effective_weight = self.weight + (self.lora_B @ self.lora_A).squeeze(-1) * self.scaling
+            return F.layer_norm(x, self.normalized_shape, effective_weight, self.bias, self.eps)
+        else:
+            return nn.LayerNorm.forward(self, x)
